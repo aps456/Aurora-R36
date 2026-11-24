@@ -24,6 +24,7 @@ esac
 TMP="/tmp/aurora-update-$$"
 mkdir -p "$TMP"
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
+write_status "Checking GitHub for the latest Aurora release..."
 API="https://api.github.com/repos/$OWNER/$NAME/releases/latest"
 if ! curl -fsSL "$API" -o "$TMP/release.json"; then
   write_status "Could not contact GitHub Releases. Check the network and try again."
@@ -35,10 +36,12 @@ if [ -z "$URL" ]; then
   write_status "No published $ASSET asset was found. A GitHub Release must exist first."
   exit 1
 fi
+write_status "Downloading ${TAG:-latest} for this device..."
 if ! curl -fL "$URL" -o "$TMP/update.zip"; then
   write_status "Aurora update download failed. The installed version was not changed."
   exit 1
 fi
+write_status "Verifying downloaded package..."
 if ! unzip -oq "$TMP/update.zip" -d "$TMP/unpacked"; then
   write_status "Downloaded update archive is invalid. The installed version was not changed."
   exit 1
@@ -49,10 +52,12 @@ if [ -z "$BIN" ]; then
   exit 1
 fi
 # Verify the downloaded executable before replacing the current one.
+write_status "Checking executable compatibility..."
 if ! "$BIN" --version >/dev/null 2>&1; then
   write_status "Downloaded binary is not compatible. The installed version was not changed."
   exit 1
 fi
+write_status "Installing update. Your library and artwork cache will be preserved..."
 cp "$BIN" "$APP_DIR/aurora.new"
 chmod 755 "$APP_DIR/aurora.new"
 if [ -f "$APP_DIR/aurora" ]; then cp "$APP_DIR/aurora" "$APP_DIR/aurora.previous"; fi
@@ -62,4 +67,9 @@ if ! mv "$APP_DIR/aurora.new" "$APP_DIR/aurora"; then
   exit 1
 fi
 rm -f "$APP_DIR/aurora.previous"
+# Refresh bundled UI icon assets when present; preserve artwork and user data.
+if [ -d "$TMP/unpacked/ports/Aurora-R36/icons" ]; then
+  mkdir -p "$APP_DIR/icons"
+  cp -f "$TMP/unpacked/ports/Aurora-R36/icons/"*.bmp "$APP_DIR/icons/" 2>/dev/null || true
+fi
 write_status "Aurora updated to ${TAG:-latest}. Restart Aurora to use the new version."

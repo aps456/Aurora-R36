@@ -1,24 +1,26 @@
-# Aurora R36 — Native C / SDL2 (v0.4.0)
+# Aurora R36 — Native C / SDL2 (v0.4.1)
 
 Aurora is an offline, fullscreen music player for the R36 Ultra's 720×720 display. The interface is C11 + SDL2; MPV handles audio playback, while FFmpeg/ffprobe provide metadata and album-art extraction.
 
 - Repository: https://github.com/aps456/Aurora-R36
-- Source version: 0.4.0
+- Source version: 0.4.1
 - License: GNU GPL v3 (retained from the existing repository)
 
-## v0.4.0 interface
+## v0.4.1 interface
 
-- Apple Music-inspired dark interface, scaled for a square 720×720 screen.
+- Apple Music-inspired interface with selectable dark and light appearances, scaled for a square 720×720 screen.
 - Vertical home/library list: Recently Added, Songs, Artists, Albums, Playlists, Folders and Settings. No bottom tab/navigation bar.
 - A compact Now Playing strip appears at the bottom of the home list while a track is active; selecting it returns to Now Playing.
 - A consistent top status strip displays local time, Wi-Fi connection state and battery percentage/charging state when the firmware exposes those values through standard Linux sysfs paths.
 - Now Playing has centered artwork, centered song title and `Album Artist | Album | Year`, progress/time, a codec/bit-depth/sample-rate line separated with vertical bars, and large playback controls. It has no Now Playing header, down-arrow, cast/TV, like/favourite or three-dot controls.
-- The background tint follows the dominant album-art colour.
+- Dark and light appearance modes replace the previous violet-heavy palette.
+- Home/library icons are loaded from `Aurora-R36/icons/` as external BMP assets.
+- Album artwork thumbnails and full covers are cached under `Aurora-R36/artwork/` for repeat-launch speed.
 - A temporary iPhone-style volume overlay appears when the D-pad changes the volume.
 
 ## Controller layout
 
-Aurora uses SDL's GameController mapping where the firmware provides one. A raw SDL joystick fallback is included for the common R36 Ultra SDL button order.
+Aurora normalizes the face-button labels reported by the firmware before dispatching actions. The raw SDL joystick fallback uses the common R36 Ultra Linux order and D-pad hat events.
 
 | Hardware control | Aurora action |
 |---|---|
@@ -34,7 +36,7 @@ Aurora uses SDL's GameController mapping where the firmware provides one. A raw 
 | Select + Start together | Quit Aurora |
 | L1/L2/R1/R2 and stick clicks | No action |
 
-The SDL GameController layer uses the firmware's mapping when one is available. The raw fallback uses the common R36-family joystick event order: B=0, A=1, X=2, Y=3, D-pad directions=8–11, Select=12 and Start=13; axes 0–3 are the left/right stick X/Y axes. This raw layout is documented for R36-family devices, but firmware and board revisions can differ. It has not yet been physically verified on every R36 Ultra revision, so the first hardware test must confirm that the face buttons and D-pad match the labels above. No first-run remapping wizard is shown.
+The SDL GameController layer uses the firmware's mapping when one is available. The raw fallback uses the R36-family joystick event order: A=0, B=1, X=2, Y=3, Select=8 and Start=9; the D-pad arrives through SDL hat events and axes 0–3 are the left/right stick X/Y axes. Aurora explicitly swaps the firmware-reported face-button labels where needed so the physical A/B and X/Y actions match the requested labels. This raw layout is documented for R36-family devices, but firmware and board revisions can differ. It has not yet been physically verified on every R36 Ultra revision, so the first hardware test must confirm that the face buttons and D-pad match the labels above. No first-run remapping wizard is shown.
 
 ## Joystick LED settings
 
@@ -52,7 +54,7 @@ The LED controller interfaces documented by firmware projects are not uniform. T
 - Folder selector, recursive library scan, metadata cache and sorting.
 - Embedded/folder artwork thumbnails and dominant-colour extraction.
 - M3U playlist creation and playback.
-- Supported audio extensions are detected by the scanner; actual decoding depends on the installed MPV/FFmpeg build.
+- Supported audio extensions are detected by the scanner; playback requires a working MPV runtime on the device. Aurora now waits for MPV IPC readiness and reports clearly when the audio engine cannot start.
 - Crossfade presets remain gain-curve hand-offs, not true overlapping dual-track mixing.
 
 ## Runtime dependencies on the device
@@ -81,7 +83,7 @@ The package script produces `Aurora_R36_<arch>.zip` with the Ports structure and
 The workflow is `.github/workflows/release.yml`.
 
 - Push a tag matching `v*` to build and publish a release.
-- Or open Actions → Build Aurora R36 ARM releases → Run workflow and use a new release tag (default `v0.4.0`).
+- Or open Actions → Build Aurora R36 ARM releases → Run workflow and use a new release tag (default `v0.4.1`).
 
 Each release attaches `Aurora_R36_armv7.zip` and `Aurora_R36_aarch64.zip`. CI runs the source/package checks, builds both ARM variants and verifies the archive paths and executable bits.
 
@@ -101,4 +103,4 @@ No terminal is required on the handheld when installing a published prebuilt rel
 - The source can be syntax-checked independently, but a final SDL2 link requires the development package for the selected build userspace.
 - CI cross-build success verifies compilation and packaging; it does not replace testing on the physical R36 Ultra and its exact firmware.
 - Physical button indices, audio output, sysfs status reporting and LED hardware support vary by firmware revision.
-- The v0.4.0 source must be built and tested on the target hardware before it can be called a verified device-ready release.
+- The v0.4.1 source must be built and tested on the target hardware before it can be called a verified device-ready release.
