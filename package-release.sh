@@ -19,7 +19,7 @@ install -m 644 "$ROOT/README.md" "$DIST/ports/Aurora-R36/README.md"
 install -m 644 "$ROOT/LICENSE" "$DIST/ports/Aurora-R36/LICENSE"
 install -m 755 "$ROOT/Install Aurora.sh" "$DIST/ports/Install Aurora.sh"
 install -m 755 "$ROOT/Aurora.sh" "$DIST/ports/Aurora.sh"
-printf 'Aurora R36\nVersion: 0.3.0\nBuild architecture: %s\nBuild userspace: Debian Bullseye (glibc 2.31 baseline)\nRepository: aps456/Aurora-R36\n' "$ARCH" > "$DIST/ports/Aurora-R36/build-info.txt"
+printf 'Aurora R36\nVersion: 0.4.0\nBuild architecture: %s\nBuild userspace: Debian Bullseye (glibc 2.31 baseline)\nRepository: aps456/Aurora-R36\n' "$ARCH" > "$DIST/ports/Aurora-R36/build-info.txt"
 chmod 755 "$DIST/ports"/*.sh "$DIST/ports/Aurora-R36"/*.sh "$DIST/ports/Aurora-R36/aurora"
 (cd "$DIST" && zip -qr "$OUT" ports)
 echo "Created $OUT"

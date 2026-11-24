@@ -1,27 +1,68 @@
-# Aurora R36 — Native C / SDL2
+# Aurora R36 — Native C / SDL2 (v0.4.0)
 
-A lightweight fullscreen music player for ArkOS-family R36 Ultra handhelds. The UI is C11 + SDL2; MPV handles audio playback and FFmpeg/ffprobe provide metadata and album-art extraction.
+Aurora is an offline, fullscreen music player for the R36 Ultra's 720×720 display. The interface is C11 + SDL2; MPV handles audio playback, while FFmpeg/ffprobe provide metadata and album-art extraction.
 
 - Repository: https://github.com/aps456/Aurora-R36
-- Source version: 0.3.0
-- License: GNU GPL v3 (the repository's existing license is retained)
+- Source version: 0.4.0
+- License: GNU GPL v3 (retained from the existing repository)
 
-## Source features
+## v0.4.0 interface
 
-- First-run controller mapping for UP, DOWN, LEFT, RIGHT, CONFIRM, BACK, NEXT and PREVIOUS; remap later in Settings → Button Setup.
-- 720×720 Now Playing view with large square artwork, larger centered song title, centered `Album Artist | Album | Year`, codec/bit depth/sample rate, progress and timestamps, shuffle, previous, play/pause, next, repeat and three-dot affordance (no star icon).
-- Background tint extracted from a dominant quantized album-art colour.
-- Songs, Artists, Albums and Playlists; folder selection, metadata scanning and sorting.
-- Settings → Check for Updates retrieves the matching ARM release package from this repository and replaces only the executable, preserving playlists, settings and music.
+- Apple Music-inspired dark interface, scaled for a square 720×720 screen.
+- Vertical home/library list: Recently Added, Songs, Artists, Albums, Playlists, Folders and Settings. No bottom tab/navigation bar.
+- A compact Now Playing strip appears at the bottom of the home list while a track is active; selecting it returns to Now Playing.
+- A consistent top status strip displays local time, Wi-Fi connection state and battery percentage/charging state when the firmware exposes those values through standard Linux sysfs paths.
+- Now Playing has centered artwork, centered song title and `Album Artist | Album | Year`, progress/time, a codec/bit-depth/sample-rate line separated with vertical bars, and large playback controls. It has no Now Playing header, down-arrow, cast/TV, like/favourite or three-dot controls.
+- The background tint follows the dominant album-art colour.
+- A temporary iPhone-style volume overlay appears when the D-pad changes the volume.
 
-## Runtime dependencies on ArkOS
+## Controller layout
+
+Aurora uses SDL's GameController mapping where the firmware provides one. A raw SDL joystick fallback is included for the common R36 Ultra SDL button order.
+
+| Hardware control | Aurora action |
+|---|---|
+| D-pad | Navigate menus and lists |
+| Left and right analog sticks | Navigate menus and lists; ignored on Now Playing |
+| D-pad left/right tap on Now Playing | Previous/next track |
+| D-pad left/right hold on Now Playing | Rewind/fast-forward in 5-second steps |
+| D-pad up/down on Now Playing | Decrease/increase volume; hold repeats |
+| A | Select; play/pause on Now Playing |
+| B | Back |
+| X | Toggle shuffle |
+| Y | Cycle repeat: off, all, one |
+| Select + Start together | Quit Aurora |
+| L1/L2/R1/R2 and stick clicks | No action |
+
+The SDL GameController layer uses the firmware's mapping when one is available. The raw fallback uses the common R36-family joystick event order: B=0, A=1, X=2, Y=3, D-pad directions=8–11, Select=12 and Start=13; axes 0–3 are the left/right stick X/Y axes. This raw layout is documented for R36-family devices, but firmware and board revisions can differ. It has not yet been physically verified on every R36 Ultra revision, so the first hardware test must confirm that the face buttons and D-pad match the labels above. No first-run remapping wizard is shown.
+
+## Joystick LED settings
+
+Settings includes **Off**, **Album Tone** and **LED Wave** modes. Aurora detects an existing writable LED interface before enabling these options. It does not change system permissions, install kernel drivers or write to I²C directly.
+
+- On ArkOS4Clone builds exposing `/sys/class/leds/joyled/brightness`, Album Tone chooses the nearest supported static hardware colour preset; LED Wave selects the controller's built-in wave effect (the documented `200` mode).
+- On Batocera builds exposing `batocera-led-handheld`, Album Tone uses the current accent RGB colour. The fallback pulse is an ambient colour pulse, not an audio-spectrum analyser.
+- Firmware without a supported writable LED interface shows **Not Available**. In particular, not every R36 Ultra firmware build supports the joystick LEDs.
+
+The LED controller interfaces documented by firmware projects are not uniform. This release does not claim a live, music-reactive audio visualizer: that would require a separate audio-analysis path and matching hardware support.
+
+## Library and playback
+
+- Songs, Artists, Albums, Playlists and Recently Added views.
+- Folder selector, recursive library scan, metadata cache and sorting.
+- Embedded/folder artwork thumbnails and dominant-colour extraction.
+- M3U playlist creation and playback.
+- Supported audio extensions are detected by the scanner; actual decoding depends on the installed MPV/FFmpeg build.
+- Crossfade presets remain gain-curve hand-offs, not true overlapping dual-track mixing.
+
+## Runtime dependencies on the device
 
 - SDL2 runtime compatible with the firmware's display backend
 - MPV
 - FFmpeg and ffprobe
-- curl and unzip (for in-app updates)
+- curl and unzip for in-app updates
 
-The executable dynamically links SDL2. The correct binary depends on the device's userspace architecture, which can be checked with `uname -m` from a computer-side diagnostic or device terminal. The release workflow generates ARMv7 and AArch64 builds using Debian Bullseye ARM userspace. Physical testing on the exact R36 Ultra firmware is still required before claiming compatibility.
+Build against the SDL2 headers and libraries matching the exact firmware image. Do not replace the system SDL2 library: some firmware images carry KMSDRM and panel-orientation patches.
 
 ## Build locally
 
@@ -33,56 +74,31 @@ make clean all
 sh package-release.sh armv7   # or aarch64
 ```
 
-The package script produces `Aurora_R36_<arch>.zip` with the required ArkOS `ports/` structure and executable permissions.
+The package script produces `Aurora_R36_<arch>.zip` with the Ports structure and executable permissions. A generic desktop binary is not guaranteed to run on the handheld; architecture, ABI, glibc and SDL2 must match the device firmware.
 
 ## GitHub Actions and releases
 
-The workflow is at `.github/workflows/release.yml`.
+The workflow is `.github/workflows/release.yml`.
 
 - Push a tag matching `v*` to build and publish a release.
-- Or open Actions → Build Aurora R36 ARM releases → Run workflow and provide a release tag (default `v0.3.0`).
+- Or open Actions → Build Aurora R36 ARM releases → Run workflow and use a new release tag (default `v0.4.0`).
 
-Each release attaches:
+Each release attaches `Aurora_R36_armv7.zip` and `Aurora_R36_aarch64.zip`. CI runs the source/package checks, builds both ARM variants and verifies the archive paths and executable bits.
 
-- `Aurora_R36_armv7.zip`
-- `Aurora_R36_aarch64.zip`
+## Install a published device package
 
-The workflow compiles in the matching ARM Debian Bullseye userspace, runs source/package checks, packages the binary, then verifies both the required Ports paths and executable ZIP modes before publishing.
+1. Back up the ROMS SD card.
+2. Download the ARM package matching the firmware userspace from GitHub Releases.
+3. Extract the ZIP on a computer.
+4. Copy its `ports/` folder to the root of the ROMS partition, merging with the existing `ports/` folder.
+5. Safely eject the SD card, boot the handheld, then open Ports → Install Aurora.
+6. After the installer confirms success, open Ports → Aurora.
 
-## Install on the R36 Ultra without a terminal
+No terminal is required on the handheld when installing a published prebuilt release package.
 
-1. Open the GitHub Releases page and download the architecture package that matches the console's OS userspace.
-2. Extract the ZIP on a computer.
-3. Copy the ZIP's `ports/` folder to the root of the SD card's ROMS partition, merging with the existing `ports/` folder.
-4. Safely eject the SD card and boot the console.
-5. Open Ports → Install Aurora. After the installer confirms, open Ports → Aurora.
+## Verification status and limitations
 
-The device ZIP includes:
-
-```text
-ports/
-├── Aurora.sh
-├── Install Aurora.sh
-└── Aurora-R36/
-    ├── aurora
-    ├── Aurora.sh
-    ├── install.sh
-    ├── update.sh
-    ├── github_repo.txt
-    ├── build-info.txt
-    ├── README.md
-    └── LICENSE
-```
-
-No terminal is required on the handheld for installing a published prebuilt package.
-
-## In-app updates
-
-The repository is configured in `github_repo.txt` as `aps456/Aurora-R36`. Once a GitHub Release has assets attached, choose Settings → Check for Updates. The updater selects the ARM asset from `uname -m`, downloads and verifies that the binary starts, then atomically replaces the application executable. User configuration, cached metadata, playlists and music remain in place.
-
-## Limitations and verification
-
-- Crossfade options currently use different fade curves; beat detection, vocal separation and real dual-track overlap are not implemented.
-- CI cross-build output still needs a successful GitHub Actions run and testing on the physical console. The local preparation environment does not have SDL2 development headers, so a local SDL2 link was not run here.
-- SDL2 KMSDRM setup, physical controller mappings, actual audio output and minimum GLIBC compatibility vary by firmware image. If the binary does not start, do not modify firmware; capture the error/diagnostics and build against the matching device sysroot.
-- Codec compatibility depends on the installed MPV/FFmpeg build; no player can guarantee every proprietary or uncommon format.
+- The source can be syntax-checked independently, but a final SDL2 link requires the development package for the selected build userspace.
+- CI cross-build success verifies compilation and packaging; it does not replace testing on the physical R36 Ultra and its exact firmware.
+- Physical button indices, audio output, sysfs status reporting and LED hardware support vary by firmware revision.
+- The v0.4.0 source must be built and tested on the target hardware before it can be called a verified device-ready release.

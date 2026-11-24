@@ -21,7 +21,8 @@
 #include <time.h>
 #include <unistd.h>
 
-#define APP_NAME "AURORA R36"
+#define APP_NAME "AURORA"
+#define APP_VERSION "0.4.0"
 #define W 720
 #define H 720
 #define MAX_TRACKS 12000
@@ -50,9 +51,8 @@ typedef struct {
     int seen;
 } Track;
 
-typedef enum { PAGE_HOME, PAGE_LIST, PAGE_NOW, PAGE_SETTINGS, PAGE_FOLDERS, PAGE_PLAYLISTS, PAGE_BUTTON_SETUP } Page;
-typedef struct { int kind; int code; } ButtonBinding; /* 1=joystick button, 2=hat direction */
-typedef enum { LIST_ALL, LIST_ARTISTS, LIST_ALBUMS, LIST_PLAYLISTS } ListKind;
+typedef enum { PAGE_HOME, PAGE_LIST, PAGE_NOW, PAGE_SETTINGS, PAGE_FOLDERS, PAGE_PLAYLISTS } Page;
+typedef enum { LIST_ALL, LIST_ARTISTS, LIST_ALBUMS, LIST_PLAYLISTS, LIST_RECENT } ListKind;
 
 static Track tracks[MAX_TRACKS];
 static int track_count = 0;
@@ -99,14 +99,30 @@ static SDL_Surface *cover_surface = NULL;
 static SDL_Texture *cover_texture = NULL;
 static SDL_Color accent = {125, 82, 160, 255};
 static int running = 1;
-static int pending_create_playlist = 0;
 static char playlist_name[80] = "";
 static int text_entry = 0;
-static ButtonBinding button_map[8] = {{2,SDL_HAT_UP},{2,SDL_HAT_DOWN},{2,SDL_HAT_LEFT},{2,SDL_HAT_RIGHT},{1,0},{1,1},{1,4},{1,5}};
-static const char *button_names[8] = {"UP","DOWN","LEFT","RIGHT","CONFIRM","BACK","NEXT","PREVIOUS"};
-static int setup_step = 0;
-static int button_setup_done = 0;
-static int setup_active = 0;
+static int shuffle_enabled = 0;
+static int repeat_mode = 0; /* 0=off, 1=all, 2=one */
+static int led_mode = 0;    /* 0=off, 1=album colour, 2=ambient pulse */
+static int led_available = 0;
+static int led_driver = 0; /* 1=ArkOS4Clone joyled sysfs, 2=Batocera LED helper */
+static Page page_before_now = PAGE_HOME;
+static Uint32 volume_overlay_until = 0;
+static int volume_overlay_value = 85;
+static Uint32 seek_overlay_until = 0;
+static int seek_overlay_direction = 0;
+static int held_dirs[4] = {0,0,0,0};
+static Uint32 held_since[4] = {0,0,0,0};
+static Uint32 held_repeat[4] = {0,0,0,0};
+static int held_long[4] = {0,0,0,0};
+static int hat_dirs = 0;
+static int select_pressed = 0, start_pressed = 0;
+static int stick_dirs[4] = {0,0,0,0};
+static Uint32 stick_repeat[4] = {0,0,0,0};
+static Uint32 last_status_poll = 0, last_led_poll = 0;
+static int system_battery = -1, system_wifi = 0, system_charging = 0;
+static int last_led_r = -1, last_led_g = -1, last_led_b = -1;
+static SDL_GameController *game_controller = NULL;
 typedef struct { int track; SDL_Texture *texture; } Thumb;
 static Thumb thumbs[12];
 static int thumb_cursor = 0;
@@ -116,6 +132,11 @@ static pthread_cond_t thumb_cond = PTHREAD_COND_INITIALIZER;
 static int thumb_worker_running = 0, thumb_worker_stop = 0;
 static int thumb_queue[MAX_TRACKS], thumb_qhead = 0, thumb_qtail = 0;
 static unsigned char thumb_queued[MAX_TRACKS], thumb_done[MAX_TRACKS];
+
+/* Forward declarations for the controller/navigation helpers. */
+static void handle_key(SDL_Keycode key);
+static void start_new_playlist(void);
+static SDL_Texture *get_thumb(int idx);
 
 /* A compact built-in 5x7 uppercase bitmap font. No SDL_ttf or bundled font needed. */
 static const unsigned char glyphs[48][5] = {
@@ -331,7 +352,7 @@ static int cmp_field(const Track *a,const Track *b) {
 }
 static void rebuild_view(void) {
     view_count=0;
-    if(list_kind==LIST_ALL){for(int i=0;i<track_count;i++)view_indices[view_count++]=i;}
+    if(list_kind==LIST_ALL||list_kind==LIST_RECENT){for(int i=0;i<track_count;i++)view_indices[view_count++]=i;}
     else if(list_kind==LIST_ARTISTS){
         for(int i=0;i<track_count;i++){int seen=0;for(int j=0;j<view_count;j++)if(!strcasecmp(tracks[i].album_artist,tracks[view_indices[j]].album_artist)){seen=1;break;}if(!seen)view_indices[view_count++]=i;}
     } else if(list_kind==LIST_ALBUMS){
@@ -341,6 +362,7 @@ static void rebuild_view(void) {
         int cmp=0;
         if(list_kind==LIST_ARTISTS)cmp=strcasecmp(tracks[view_indices[i]].album_artist,tracks[view_indices[j]].album_artist);
         else if(list_kind==LIST_ALBUMS)cmp=strcasecmp(tracks[view_indices[i]].album,tracks[view_indices[j]].album);
+        else if(list_kind==LIST_RECENT)cmp=(tracks[view_indices[i]].mtime<tracks[view_indices[j]].mtime)?1:(tracks[view_indices[i]].mtime>tracks[view_indices[j]].mtime?-1:0);
         else cmp=cmp_field(&tracks[view_indices[i]],&tracks[view_indices[j]]);
         if(cmp>0){int x=view_indices[i];view_indices[i]=view_indices[j];view_indices[j]=x;}
     }
@@ -348,8 +370,7 @@ static void rebuild_view(void) {
 }
 static void save_config(void) {
     char p[MAX_PATH];snprintf(p,sizeof(p),"%s/settings.conf",config_dir);FILE *f=fopen(p,"w");if(!f)return;
-    fprintf(f,"music_folder=%s\nvolume=%d\nsort_order=%s\ncrossfade_enabled=%d\ncrossfade_mode=%d\ncrossfade_seconds=%d\nbutton_setup_done=%d\n",music_folder,volume,sort_order,crossfade_enabled,crossfade_mode,crossfade_seconds,button_setup_done);
-    for(int i=0;i<8;i++)fprintf(f,"button_%d=%d,%d\n",i,button_map[i].kind,button_map[i].code);
+    fprintf(f,"music_folder=%s\nvolume=%d\nsort_order=%s\ncrossfade_enabled=%d\ncrossfade_mode=%d\ncrossfade_seconds=%d\nshuffle_enabled=%d\nrepeat_mode=%d\nled_mode=%d\n",music_folder,volume,sort_order,crossfade_enabled,crossfade_mode,crossfade_seconds,shuffle_enabled,repeat_mode,led_mode);
     fclose(f);
 }
 static void load_config(void) {
@@ -364,13 +385,16 @@ static void load_config(void) {
         else if(!strcmp(ln,"crossfade_enabled"))crossfade_enabled=atoi(eq);
         else if(!strcmp(ln,"crossfade_mode"))crossfade_mode=atoi(eq);
         else if(!strcmp(ln,"crossfade_seconds"))crossfade_seconds=atoi(eq);
-        else if(!strcmp(ln,"button_setup_done"))button_setup_done=atoi(eq);
-        else if(!strncmp(ln,"button_",7)){int i=atoi(ln+7),kind=0,code=0;if(i>=0&&i<8&&sscanf(eq,"%d,%d",&kind,&code)==2){button_map[i].kind=kind;button_map[i].code=code;}}
+        else if(!strcmp(ln,"shuffle_enabled"))shuffle_enabled=atoi(eq);
+        else if(!strcmp(ln,"repeat_mode"))repeat_mode=atoi(eq);
+        else if(!strcmp(ln,"led_mode"))led_mode=atoi(eq);
     }fclose(f);
     if(volume<0)volume=0;
     if(volume>100)volume=100;
     if(crossfade_seconds<1)crossfade_seconds=1;
     if(crossfade_seconds>12)crossfade_seconds=12;
+    if(repeat_mode<0||repeat_mode>2)repeat_mode=0;
+    if(led_mode<0||led_mode>2)led_mode=0;
 }
 static int mpv_send(const char *json,char *response,size_t cap) {
     struct sockaddr_un addr; int s=socket(AF_UNIX,SOCK_STREAM,0); if(s<0)return -1;
@@ -443,6 +467,7 @@ static double fade_curve(double t) {
 }
 static void start_track_now(int idx,int fade_in) {
     if(idx<0||idx>=track_count)return;
+    if(page!=PAGE_NOW)page_before_now=page;
     transition_target=-1;fade_stage=0;current_track=idx;position_sec=0;duration_sec=tracks[idx].duration;cache_cover(idx);mpv_play_path(tracks[idx].path);page=PAGE_NOW;
     if(fade_in&&crossfade_enabled){mpv_set_volume(0);fade_stage=2;fade_started=SDL_GetTicks();fade_start_value=0;}
     else mpv_set_volume(volume);
@@ -450,20 +475,31 @@ static void start_track_now(int idx,int fade_in) {
 static void play_index(int idx) {
     if(idx<0||idx>=track_count)return;
     if(crossfade_enabled&&current_track>=0&&current_track!=idx){
+        if(page!=PAGE_NOW)page_before_now=page;
         transition_target=idx;fade_stage=1;fade_started=SDL_GetTicks();fade_start_value=actual_volume;page=PAGE_NOW;return;
     }
     start_track_now(idx,crossfade_enabled&&current_track<0);
 }
+static int random_track_from_queue(void) {
+    if(queue_count<=0)return track_count>0?rand()%track_count:-1;
+    if(queue_count==1)return queue_indices[0];
+    int p=queue_pos;for(int tries=0;tries<8&&p==queue_pos;tries++)p=rand()%queue_count;
+    queue_pos=p;return queue_indices[p];
+}
 static void play_next(int dir) {
     int next=-1;
-    if(queue_count>0){queue_pos+=dir;if(queue_pos<0)queue_pos=queue_count-1;if(queue_pos>=queue_count)queue_pos=0;next=queue_indices[queue_pos];}
+    if(shuffle_enabled){next=random_track_from_queue();}
+    else if(queue_count>0){int p=queue_pos+dir;if(p<0)p=queue_count-1;if(p>=queue_count)p=0;queue_pos=p;next=queue_indices[p];}
     else if(track_count){int i=current_track<0?0:current_track+dir;if(i<0)i=track_count-1;if(i>=track_count)i=0;next=i;}
     if(next>=0)play_index(next);
 }
 static void play_next_automatic(void) {
     int next=-1;
-    if(queue_count>0){queue_pos++;if(queue_pos>=queue_count)queue_pos=0;next=queue_indices[queue_pos];}
-    else if(track_count){int i=current_track+1;if(i>=track_count)i=0;next=i;}
+    if(current_track<0)return;
+    if(repeat_mode==2){start_track_now(current_track,crossfade_enabled);return;}
+    if(shuffle_enabled){next=random_track_from_queue();}
+    else if(queue_count>0){int p=queue_pos+1;if(p>=queue_count){if(repeat_mode==0){mpv_cmd("{\"command\":[\"stop\"]}");paused=1;return;}p=0;}queue_pos=p;next=queue_indices[p];}
+    else if(track_count){int i=current_track+1;if(i>=track_count){if(repeat_mode==0){mpv_cmd("{\"command\":[\"stop\"]}");paused=1;return;}i=0;}next=i;}
     if(next>=0)start_track_now(next,crossfade_enabled);
 }
 static void update_fade(void) {
@@ -498,11 +534,6 @@ static int create_playlist_file(const char *name) {
     if(!n)return 0;
     char path[MAX_PATH];snprintf(path,sizeof(path),"%s/%s.m3u",playlist_dir,safe);FILE *f=fopen(path,"a");if(!f)return 0;fclose(f);snprintf(active_playlist,sizeof(active_playlist),"%s",path);return 1;
 }
-static void add_to_playlist(int idx) {
-    if(idx<0||idx>=track_count)return;
-    if(!active_playlist[0]){char p[MAX_PATH];snprintf(p,sizeof(p),"%s/Favorites.m3u",playlist_dir);snprintf(active_playlist,sizeof(active_playlist),"%s",p);}
-    FILE *f=fopen(active_playlist,"a");if(!f){toast_msg("CANNOT WRITE PLAYLIST");return;}fprintf(f,"%s\n",tracks[idx].path);fclose(f);toast_msg("ADDED TO PLAYLIST");
-}
 static void build_playlist_view(const char *file) {
     view_count=0;queue_count=0;FILE *f=fopen(file,"r");if(!f)return;char linebuf[MAX_PATH];while(fgets(linebuf,sizeof(linebuf),f)&&queue_count<MAX_TRACKS){linebuf[strcspn(linebuf,"\r\n")]=0;for(int i=0;i<track_count;i++)if(!strcmp(tracks[i].path,linebuf)){view_indices[view_count++]=i;queue_indices[queue_count++]=i;break;}}fclose(f);selected=0;scroll_pos=0;queue_pos=0;page=PAGE_LIST;snprintf(page_title,sizeof(page_title),"PLAYLIST");
 }
@@ -511,10 +542,59 @@ static void render_background(void) {
     SDL_SetRenderDrawColor(renderer,bg.r,bg.g,bg.b,255);SDL_RenderClear(renderer);
     if(page==PAGE_NOW){for(int i=0;i<6;i++){int v=18-i*2;SDL_Color c=rgb((int)(bg.r+v),(int)(bg.g+v),(int)(bg.b+v));fill_rect(0,i*120,W,120,c);}}
 }
+static int read_int_file(const char *path,int *value) {
+    FILE *f=fopen(path,"r");if(!f)return 0;int n=0;int ok=fscanf(f,"%d",&n)==1;fclose(f);if(ok&&value)*value=n;return ok;
+}
+static int read_text_file(const char *path,char *out,size_t cap) {
+    if(!cap)return 0;
+    FILE *f=fopen(path,"r");
+    if(!f){out[0]=0;return 0;}
+    if(!fgets(out,(int)cap,f)){fclose(f);out[0]=0;return 0;}
+    fclose(f);
+    out[strcspn(out,"\r\n")]=0;
+    return 1;
+}
+static void poll_system_status(void) {
+    Uint32 now=SDL_GetTicks();if(now-last_status_poll<1000)return;last_status_poll=now;
+    system_battery=-1;system_charging=0;
+    const char *battery_paths[]={"/sys/class/power_supply/BAT0/capacity","/sys/class/power_supply/battery/capacity","/sys/class/power_supply/BATTERY/capacity",NULL};
+    for(int i=0;battery_paths[i];i++)if(read_int_file(battery_paths[i],&system_battery))break;
+    if(system_battery<0){
+        DIR *d=opendir("/sys/class/power_supply");if(d){struct dirent *e;while((e=readdir(d))){if(e->d_name[0]=='.')continue;char path[256],type[32];snprintf(path,sizeof(path),"/sys/class/power_supply/%s/type",e->d_name);if(read_text_file(path,type,sizeof(type))&&!strcasecmp(type,"Battery")){snprintf(path,sizeof(path),"/sys/class/power_supply/%s/capacity",e->d_name);if(read_int_file(path,&system_battery))break;}}closedir(d);}
+    }
+    if(system_battery>100)system_battery=100;
+    if(system_battery<0)system_battery=-1;
+    system_wifi=0;DIR *nd=opendir("/sys/class/net");if(nd){struct dirent *e;while((e=readdir(nd))){
+        if(e->d_name[0]=='.'||!strcmp(e->d_name,"lo"))continue;
+        char path[256],state[32];
+        snprintf(path,sizeof(path),"/sys/class/net/%s/wireless",e->d_name);
+        int is_wireless=(access(path,F_OK)==0 || !strncmp(e->d_name,"wlan",4) || !strncmp(e->d_name,"wl",2));
+        if(!is_wireless)continue;
+        snprintf(path,sizeof(path),"/sys/class/net/%s/operstate",e->d_name);
+        if(read_text_file(path,state,sizeof(state))&&!strcmp(state,"up")){system_wifi=1;break;}
+        int carrier=0;snprintf(path,sizeof(path),"/sys/class/net/%s/carrier",e->d_name);
+        if(read_int_file(path,&carrier)&&carrier==1){system_wifi=1;break;}
+    }closedir(nd);}
+    const char *status_paths[]={"/sys/class/power_supply/BAT0/status","/sys/class/power_supply/battery/status","/sys/class/power_supply/BATTERY/status",NULL};char status[32]="";
+    for(int i=0;status_paths[i];i++)if(read_text_file(status_paths[i],status,sizeof(status)))break;
+    system_charging=(!strcasecmp(status,"Charging"));
+}
+static void draw_wifi_icon(int x,int y,SDL_Color c,int connected) {
+    if(connected){line(x-8,y+2,x,y-5,c);line(x,y-5,x+8,y+2,c);line(x-5,y+2,x,y-2,c);line(x,y-2,x+5,y+2,c);circle(x,y+5,2,c,1);}else{line(x-7,y-4,x+7,y+5,c);line(x-7,y+5,x+7,y-4,c);}
+}
+static void draw_battery_icon(int x,int y,int percent,int charging,SDL_Color c) {
+    SDL_Rect body={x,y,24,12};SDL_SetRenderDrawColor(renderer,c.r,c.g,c.b,c.a);SDL_RenderDrawRect(renderer,&body);fill_rect(x+24,y+4,3,4,c);
+    if(percent>=0){int w=(22*percent)/100;if(w>0)fill_rect(x+1,y+1,w,10,charging?rgb(115,214,151):c);}else fill_rect(x+1,y+1,8,10,c);
+    if(charging){line(x+12,y+1,x+9,y+6,rgb(15,15,20));line(x+9,y+6,x+14,y+6,rgb(15,15,20));line(x+14,y+6,x+11,y+11,rgb(15,15,20));}
+}
+static void render_status_bar(void) {
+    poll_system_status();SDL_Color white=rgb(244,242,248),muted=rgb(185,180,192);time_t now=time(NULL);struct tm *tmv=localtime(&now);char clock_text[16]="--:--";if(tmv)strftime(clock_text,sizeof(clock_text),"%H:%M",tmv);
+    text(clock_text,26,13,12,white,0);draw_wifi_icon(610,19,system_wifi?white:muted,system_wifi);draw_battery_icon(644,13,system_battery,system_charging,white);
+    if(system_battery>=0){char pct[8];snprintf(pct,sizeof(pct),"%d%%",system_battery);text(pct,688,14,9,muted,1);}line(24,42,696,42,rgb(55,50,65));
+}
 static void render_top(const char *sub) {
-    SDL_Color white=rgb(245,242,250),muted=rgb(160,154,174),pink=rgb(242,116,173);
-    text(APP_NAME,32,24,16,white,0);text(sub,688,28,12,muted,1);line(32,60,688,60,rgb(55,50,65));
-    (void)pink;
+    SDL_Color white=rgb(245,242,250),muted=rgb(160,154,174);render_status_bar();
+    text(APP_NAME,28,54,15,white,0);if(sub)text(sub,690,57,11,muted,1);line(24,82,696,82,rgb(55,50,65));
 }
 static void render_button(int x,int y,const char *label,int selected_btn,int radius) {
     SDL_Color c=selected_btn?rgb(242,112,174):rgb(64,58,76);SDL_Color white=rgb(255,255,255);circle(x,y,radius,c,1);
@@ -525,13 +605,54 @@ static void render_button(int x,int y,const char *label,int selected_btn,int rad
         else {fill_rect(x+7,y-9,3,18,white);line(x-6,y-10,x+7,y,white);line(x+7,y,x-6,y+10,white);line(x-6,y+10,x-6,y-10,white);}
     } else text(label,x,y-7,16,white,1);
 }
+static void draw_home_icon(int kind,int cx,int cy,SDL_Color c) {
+    switch(kind){
+        case 0: /* Recently added: clock */
+            circle(cx,cy,13,c,0);line(cx,cy,cx,cy-8,c);line(cx,cy,cx+7,cy+3,c);break;
+        case 1: /* Songs: music note */
+            line(cx+5,cy-13,cx+5,cy+6,c);line(cx+5,cy-13,cx+14,cy-16,c);line(cx+14,cy-16,cx+14,cy+3,c);
+            circle(cx+1,cy+7,5,c,1);circle(cx+10,cy+4,5,c,1);break;
+        case 2: /* Artists: person */
+            circle(cx,cy-6,5,c,0);line(cx-12,cy+12,cx-9,cy+4,c);line(cx-9,cy+4,cx,cy+1,c);line(cx,cy+1,cx+9,cy+4,c);line(cx+9,cy+4,cx+12,cy+12,c);break;
+        case 3: /* Albums: record */
+            circle(cx,cy,14,c,0);circle(cx,cy,5,c,0);circle(cx,cy,2,c,1);break;
+        case 4: /* Playlists: ordered lines */
+            for(int k=0;k<3;k++){fill_rect(cx-12,cy-10+k*10,3,3,c);line(cx-5,cy-8+k*10,cx+13,cy-8+k*10,c);}break;
+        case 5: /* Folders */
+            line(cx-14,cy-7,cx-14,cy+11,c);line(cx-14,cy+11,cx+14,cy+11,c);line(cx+14,cy+11,cx+14,cy-8,c);
+            line(cx+14,cy-8,cx+2,cy-8,c);line(cx+2,cy-8,cx-2,cy-13,c);line(cx-2,cy-13,cx-14,cy-13,c);line(cx-14,cy-13,cx-14,cy-7,c);break;
+        default: /* Settings: gear */
+            circle(cx,cy,9,c,0);circle(cx,cy,3,c,0);
+            for(int k=0;k<8;k++){double a=(double)k*0.78539816339;int x1=cx+(int)(10*cos(a)),y1=cy+(int)(10*sin(a));int x2=cx+(int)(14*cos(a)),y2=cy+(int)(14*sin(a));line(x1,y1,x2,y2,c);}break;
+    }
+}
 static void render_home(void) {
-    render_top("OFFLINE MUSIC");SDL_Color white=rgb(247,244,250),muted=rgb(161,154,174);
-    text("YOUR MUSIC, YOUR WAY",360,102,24,white,1);text("AURORA",360,160,46,white,1);
-    const char *names[]={"ALL SONGS","ARTISTS","ALBUMS","PLAYLISTS","SETTINGS"};
-    const char *desc[]={"EVERY TRACK IN YOUR LIBRARY","BROWSE BY ALBUM ARTIST","EXPLORE YOUR ALBUMS","YOUR CUSTOM COLLECTIONS","PLAYBACK AND LIBRARY"};
-    for(int i=0;i<5;i++){int y=238+i*82;round_panel(76,y,568,66,rgb(34,30,43));text(names[i],110,y+15,20,white,0);text(desc[i],610,y+22,10,muted,1);if(i==selected)round_panel(76,y,5,66,rgb(242,112,174));}
-    text("A SELECT     X ADD TO PLAYLIST     Y NOW PLAYING",360,666,10,muted,1);
+    render_status_bar();SDL_Color white=rgb(247,244,250),muted=rgb(161,154,174);
+    text("LISTEN NOW",30,63,28,white,0);text("YOUR MUSIC LIBRARY",31,105,10,muted,0);
+    const char *names[]={"RECENTLY ADDED","SONGS","ARTISTS","ALBUMS","PLAYLISTS","FOLDERS","SETTINGS"};
+    const char *desc[]={"Your newest music","All songs in your library","Browse your artists","Explore your albums","Your personal collections","Browse music folders","Customize Aurora"};
+    const SDL_Color tile[]={ {118,77,146,255},{72,100,149,255},{153,91,126,255},{67,124,119,255},{151,107,65,255},{85,104,125,255},{93,88,112,255} };
+    for(int i=0;i<7;i++){
+        int y=133+i*71;if(i==selected)round_panel(24,y,672,62,rgb(47,40,57));
+        round_panel(36,y+6,48,48,tile[i]);
+        draw_home_icon(i,60,y+30,rgb(255,255,255));
+        text(names[i],104,y+13,15,white,0);text(desc[i],104,y+36,9,muted,0);
+        line(104,y+67,696,y+67,rgb(44,40,50));
+        line(680,y+27,686,y+33,muted);line(686,y+33,680,y+39,muted);
+    }
+    if(current_track>=0&&current_track<track_count){
+        int y=632;if(selected==7)round_panel(24,y,672,67,rgb(47,40,57));
+        SDL_Texture *thumb=get_thumb(current_track);
+        if(thumb){SDL_Rect td={38,y+8,50,50};SDL_RenderCopy(renderer,thumb,NULL,&td);}
+        else round_panel(38,y+8,50,50,rgb(67,54,82));
+        text("NOW PLAYING",104,y+13,9,rgb(242,151,190),0);
+        text_width(tracks[current_track].title,104,y+29,13,white,470);
+        text_width(tracks[current_track].album_artist,104,y+49,8,muted,470);
+        circle(650,y+33,19,rgb(242,112,174),1);
+        line(646,y+24,646,y+42,rgb(255,255,255));
+        line(646,y+24,660,y+33,rgb(255,255,255));
+        line(660,y+33,646,y+42,rgb(255,255,255));
+    }
 }
 static void thumb_path_for(int idx, char *bmp, size_t cap) {
     unsigned long h=5381;for(const char *p=tracks[idx].path;*p;p++)h=((h<<5)+h)+(unsigned char)*p;
@@ -578,76 +699,71 @@ static SDL_Texture *get_thumb(int idx) {
 
 static void render_list(void) {
     render_top(page_title);SDL_Color white=rgb(246,243,250),muted=rgb(154,148,166);
-    char info[128];snprintf(info,sizeof(info),"%d ITEMS   SORT: %s",view_count,sort_order);text(info,360,82,11,muted,1);
+    char info[128];snprintf(info,sizeof(info),"%d ITEMS   SORT: %s",view_count,sort_order);text(info,360,94,10,muted,1);
     int rows=10;if(selected<scroll_pos)scroll_pos=selected;if(selected>=scroll_pos+rows)scroll_pos=selected-rows+1;
     for(int r=0;r<rows&&scroll_pos+r<view_count;r++){
-        int at=scroll_pos+r,idx=view_indices[at],y=116+r*49;Track *t=&tracks[idx];
-        if(at==selected)round_panel(38,y,644,43,rgb(54,45,66));
+        int at=scroll_pos+r,idx=view_indices[at],y=120+r*50;if(idx<0||idx>=track_count)continue;Track *t=&tracks[idx];
+        if(at==selected)round_panel(28,y,664,45,rgb(54,45,66));
         char title[MAX_TEXT+8],sub[160];snprintf(title,sizeof(title),"%s",t->title);
         if(list_kind==LIST_ARTISTS)snprintf(title,sizeof(title),"%s",t->album_artist);
         if(list_kind==LIST_ALBUMS)snprintf(title,sizeof(title),"%s",t->album);
         snprintf(sub,sizeof(sub),"%s  |  %s",t->album_artist,t->album);
-        SDL_Texture *thumb=get_thumb(idx);if(thumb){SDL_Rect td={53,y+4,35,35};SDL_RenderCopy(renderer,thumb,NULL,&td);}else{round_panel(53,y+4,35,35,rgb(67,54,82));}
-        text_width(title,101,y+7,16,white,500);text_width(sub,101,y+29,9,muted,500);
-        char dur[24];int d=(int)t->duration;snprintf(dur,sizeof(dur),"%d:%02d",d/60,d%60);text(dur,652,y+15,10,muted,1);
+        SDL_Texture *thumb=get_thumb(idx);if(thumb){SDL_Rect td={42,y+4,37,37};SDL_RenderCopy(renderer,thumb,NULL,&td);}else{round_panel(42,y+4,37,37,rgb(67,54,82));}
+        text_width(title,96,y+7,16,white,505);text_width(sub,96,y+29,9,muted,505);
+        char dur[24];int d=(int)t->duration;snprintf(dur,sizeof(dur),"%d:%02d",d/60,d%60);text(dur,654,y+16,10,muted,1);
     }
-    text("A PLAY / OPEN    X ADD    L1/R1 SORT    B BACK",360,664,10,muted,1);
+    text("A PLAY   B BACK   X SHUFFLE   Y REPEAT",360,672,9,muted,1);
 }
 static void render_now(void) {
-    SDL_Color white=rgb(250,249,250),muted=rgb(190,188,191),soft=rgb(145,143,148);
+    render_status_bar();SDL_Color white=rgb(250,249,250),muted=rgb(190,188,191),soft=rgb(145,143,148);
     if(current_track<0||current_track>=track_count){text("NOTHING PLAYING",360,340,24,white,1);text("CHOOSE A SONG FROM YOUR LIBRARY",360,380,10,muted,1);return;}
     Track *t=&tracks[current_track];
-    /* Square artwork dominates the screen, matching the supplied compact player reference. */
-    if(cover_texture){SDL_Rect dst={112,24,496,496};SDL_RenderCopy(renderer,cover_texture,NULL,&dst);}
-    else {round_panel(112,24,496,496,rgb(42,40,44));text("AURORA",360,258,32,rgb(220,218,222),1);}
-    /* Centered title and metadata; the overflow control replaces the former favorite button. */
-    draw_text_raw(t->title,360,535,3,white,1,540);
-    char meta[220];snprintf(meta,sizeof(meta),"%s | %s | %s",t->album_artist,t->album,t->year);text(meta,360,572,11,muted,1);
-    /* Three-dot menu control, deliberately no star/favorite icon. */
-    circle(650,548,23,rgb(65,63,68),1);
-    circle(642,548,2,white,1);circle(650,548,2,white,1);circle(658,548,2,white,1);
+    if(cover_texture){SDL_Rect dst={148,64,424,424};SDL_RenderCopy(renderer,cover_texture,NULL,&dst);}
+    else {round_panel(148,64,424,424,rgb(42,40,44));text("AURORA",360,270,32,rgb(220,218,222),1);}
+    draw_text_raw(t->title,360,505,3,white,1,620);
+    char meta[240];snprintf(meta,sizeof(meta),"%s | %s | %s",t->album_artist,t->album,t->year);text(meta,360,538,10,muted,1);
     int total=(int)(duration_sec>0?duration_sec:t->duration),pos=(int)position_sec;if(pos<0)pos=0;if(total<1)total=1;if(pos>total)pos=total;
-    fill_rect(84,615,552,6,rgb(91,89,93));fill_rect(84,615,(552*pos)/total,6,rgb(242,240,244));
-    char tm[32];snprintf(tm,sizeof(tm),"%d:%02d",pos/60,pos%60);text(tm,84,635,9,muted,0);
-    snprintf(tm,sizeof(tm),"-%d:%02d",(total-pos)/60,(total-pos)%60);text(tm,636,635,9,muted,1);
-    char tech[160];double sr=atof(t->sample_rate)/1000.0;
-    snprintf(tech,sizeof(tech),"%s  |  %s-bit  |  %.1f kHz",t->codec[0]?t->codec:"AUDIO",t->bit_depth[0]?t->bit_depth:"?",sr);text(tech,360,635,9,soft,1);
-    /* Shuffle and repeat flank the transport controls, as in the reference layout. */
-    line(101,672,123,688,white);line(101,688,123,672,white);line(118,672,123,672,white);line(123,672,123,677,white);line(101,683,101,688,white);line(101,688,106,688,white);
-    render_button(245,680,"|<",0,24);render_button(360,680,paused?">":"||",1,30);render_button(475,680,">|",0,24);
-    circle(608,680,23,rgb(65,63,68),1);line(596,679,596,673,white);line(596,673,601,668,white);line(601,668,615,668,white);line(615,668,619,673,white);line(619,673,614,673,white);line(619,681,619,687,white);line(619,687,614,692,white);line(614,692,600,692,white);line(600,692,596,687,white);line(596,687,601,687,white);
+    fill_rect(70,574,580,5,rgb(91,89,93));fill_rect(70,574,(580*pos)/total,5,rgb(242,240,244));
+    char tm[32];snprintf(tm,sizeof(tm),"%d:%02d",pos/60,pos%60);text(tm,70,588,9,muted,0);snprintf(tm,sizeof(tm),"-%d:%02d",(total-pos)/60,(total-pos)%60);text(tm,650,588,9,muted,1);
+    char tech[160];
+    if(t->sample_rate[0]){double sr=atof(t->sample_rate)/1000.0;snprintf(tech,sizeof(tech),"%s | %s-bit | %.1f kHz",t->codec[0]?t->codec:"AUDIO",t->bit_depth[0]?t->bit_depth:"?",sr);}
+    else snprintf(tech,sizeof(tech),"%s | %s-bit | SAMPLE RATE N/A",t->codec[0]?t->codec:"AUDIO",t->bit_depth[0]?t->bit_depth:"?");
+    text(tech,360,615,9,soft,1);
+    circle(126,671,22,shuffle_enabled?rgb(242,112,174):rgb(64,58,76),1);
+    line(116,666,130,676,white);line(116,676,130,666,white);line(126,666,130,666,white);line(130,666,130,670,white);
+    render_button(245,671,"|<",0,24);render_button(360,671,paused?">":"||",1,30);render_button(475,671,">|",0,24);
+    circle(594,671,22,repeat_mode?rgb(242,112,174):rgb(64,58,76),1);
+    line(585,670,585,664,white);line(585,664,590,660,white);line(590,660,600,660,white);line(600,660,605,665,white);line(605,665,600,665,white);
+    char rep[8];snprintf(rep,sizeof(rep),"%s",repeat_mode==2?"1":repeat_mode==1?"ALL":"OFF");text(rep,594,679,6,white,1);
 }
-static void render_button_setup(void) {
-    render_top("CONTROLLER SETUP");
-    SDL_Color white=rgb(248,246,250),muted=rgb(178,171,184);
-    text("MAP YOUR CONTROLS",360,150,25,white,1);
-    if(setup_step<8){
-        char line1[96];snprintf(line1,sizeof(line1),"PRESS THE CONTROL FOR: %s",button_names[setup_step]);
-        text(line1,360,290,17,rgb(246,145,190),1);
-        text("PRESS A D-PAD DIRECTION OR A BUTTON",360,340,11,muted,1);
-        text("B / ESC CANCELS SETUP",360,650,10,muted,1);
-        char count[32];snprintf(count,sizeof(count),"%d OF 8",setup_step+1);text(count,360,390,12,white,1);
-    } else {
-        text("BUTTON MAPPING COMPLETE",360,310,20,white,1);
-        text("PRESS CONFIRM TO SAVE",360,355,12,muted,1);
-    }
+static void render_volume_overlay(void) {
+    if(SDL_GetTicks()>=volume_overlay_until)return;
+    int x=20,y=282;round_panel(x,y,82,156,rgb(35,32,42));
+    /* Speaker glyph */
+    fill_rect(x+16,y+26,8,14,rgb(245,244,248));line(x+24,y+26,x+36,y+17,rgb(245,244,248));line(x+24,y+40,x+36,y+49,rgb(245,244,248));
+    int filled=(volume_overlay_value*86)/100;round_panel(x+25,y+62,30,92,rgb(83,78,91));if(filled>0)round_panel(x+28,y+65+(86-filled),24,filled,rgb(245,244,248));
+    char pct[12];snprintf(pct,sizeof(pct),"%d%%",volume_overlay_value);text(pct,x+41,y+126,9,rgb(255,255,255),1);
+}
+static void render_seek_overlay(void) {
+    if(SDL_GetTicks()>=seek_overlay_until)return;
+    round_panel(231,72,258,42,rgb(43,39,51));text(seek_overlay_direction>0?"FORWARD SEEK":"REWIND SEEK",360,86,10,rgb(255,255,255),1);
 }
 static void render_settings(void) {
     render_top("SETTINGS");SDL_Color white=rgb(246,243,250),muted=rgb(162,154,176);char b[256];
-    const char *labels[]={"MUSIC FOLDER","CROSSFADE","CROSSFADE MODE","CROSSFADE DURATION","SORT ORDER","RESCAN LIBRARY","VOLUME","BUTTON SETUP","CHECK FOR UPDATES"};
+    const char *labels[]={"MUSIC FOLDER","CROSSFADE","CROSSFADE MODE","CROSSFADE DURATION","SORT ORDER","RESCAN LIBRARY","VOLUME","JOYSTICK LED EFFECT","CHECK FOR UPDATES"};
     snprintf(b,sizeof(b),"%s",music_folder);
-    for(int i=0;i<9;i++){int y=92+i*64;round_panel(50,y,620,56,selected==i?rgb(55,45,67):rgb(33,29,42));text(labels[i],74,y+10,14,white,0);
-        if(i==0)text(b,630,y+20,9,muted,1);
-        if(i==1)text(crossfade_enabled?"ON":"OFF",630,y+20,12,crossfade_enabled?rgb(247,128,177):muted,1);
-        if(i==2){const char *m[]={"CROSSFADE BEATS","CROSSFADE VOCALS","NORMAL CROSSFADE","AUTO MIX"};text(m[crossfade_mode],630,y+20,9,muted,1);}
-        if(i==3){snprintf(b,sizeof(b),"%d SEC",crossfade_seconds);text(b,630,y+20,11,muted,1);}
-        if(i==4)text(sort_order,630,y+20,11,muted,1);
-        if(i==5)text("SCAN",630,y+20,11,muted,1);
-        if(i==6){snprintf(b,sizeof(b),"%d%%",volume);text(b,630,y+20,11,muted,1);}
-        if(i==7)text("CONFIGURE",630,y+20,10,muted,1);
-        if(i==8)text("CHECK",630,y+20,10,muted,1);
+    for(int i=0;i<9;i++){int y=94+i*62;round_panel(34,y,652,54,selected==i?rgb(55,45,67):rgb(33,29,42));text(labels[i],56,y+10,13,white,0);
+        if(i==0)text(b,642,y+19,8,muted,1);
+        if(i==1)text(crossfade_enabled?"ON":"OFF",642,y+18,10,crossfade_enabled?rgb(247,128,177):muted,1);
+        if(i==2){const char *m[]={"CROSSFADE BEATS","CROSSFADE VOCALS","NORMAL CROSSFADE","AUTO MIX"};text(m[crossfade_mode],642,y+18,8,muted,1);}
+        if(i==3){snprintf(b,sizeof(b),"%d SEC",crossfade_seconds);text(b,642,y+18,10,muted,1);}
+        if(i==4)text(sort_order,642,y+18,10,muted,1);
+        if(i==5)text("SCAN",642,y+18,10,muted,1);
+        if(i==6){snprintf(b,sizeof(b),"%d%%",volume);text(b,642,y+18,10,muted,1);}
+        if(i==7){const char *m[]={"OFF","ALBUM TONE","LED WAVE"};const char *v=!led_available?"NOT AVAILABLE":(led_driver==2&&led_mode==2?"AMBIENT PULSE":m[led_mode]);text(v,642,y+18,8,led_available?rgb(242,155,190):muted,1);}
+        if(i==8)text("CHECK",642,y+18,10,muted,1);
     }
-    text("A CHANGE    LEFT / RIGHT ADJUST    B BACK",360,665,10,muted,1);
+    text("A CHANGE   LEFT / RIGHT ADJUST   B BACK",360,672,9,muted,1);
 }
 static void render_folders(void) {
     render_top("SELECT MUSIC FOLDER");SDL_Color white=rgb(244,240,248),muted=rgb(165,157,177);text(folder_current,360,82,12,muted,1);
@@ -656,8 +772,9 @@ static void render_folders(void) {
 }
 static void render_playlist_names(void);
 static void render(void) {
-    render_background();if(page==PAGE_HOME)render_home();else if(page==PAGE_LIST||page==PAGE_PLAYLISTS)render_list();else if(page==PAGE_NOW)render_now();else if(page==PAGE_SETTINGS)render_settings();else if(page==PAGE_FOLDERS)render_folders();else if(page==PAGE_BUTTON_SETUP)render_button_setup();
-    if(toast[0]&&SDL_GetTicks()<toast_time){round_panel(150,24,420,42,rgb(65,52,80));text(toast,360,40,10,rgb(255,255,255),1);}
+    render_background();if(page==PAGE_HOME)render_home();else if(page==PAGE_LIST)render_list();else if(page==PAGE_PLAYLISTS)render_playlist_names();else if(page==PAGE_NOW)render_now();else if(page==PAGE_SETTINGS)render_settings();else if(page==PAGE_FOLDERS)render_folders();
+    if(page==PAGE_NOW){render_seek_overlay();render_volume_overlay();}
+    if(toast[0]&&SDL_GetTicks()<toast_time){round_panel(150,48,420,42,rgb(65,52,80));text(toast,360,63,10,rgb(255,255,255),1);}
     SDL_RenderPresent(renderer);
 }
 static void folder_activate(void) {
@@ -673,8 +790,69 @@ static void open_playlists(void) {
 static void render_playlist_names(void) {
     render_top("PLAYLISTS");SDL_Color white=rgb(247,244,250),muted=rgb(160,153,174);DIR *d=opendir(playlist_dir);char names[512][MAX_PATH];int n=0;struct dirent *e;
     if(d){while((e=readdir(d))&&n<512){size_t z=strlen(e->d_name);if(z>4&&!strcasecmp(e->d_name+z-4,".m3u"))snprintf(names[n++],MAX_PATH,"%s",e->d_name);}closedir(d);}
-    for(int i=0;i<10&&scroll_pos+i<n;i++){int at=scroll_pos+i,y=130+i*49;char title[MAX_PATH];snprintf(title,sizeof(title),"%s",names[at]);title[strlen(title)-4]=0;if(at==selected)round_panel(48,y,624,42,rgb(55,44,69));text(title,72,y+13,15,white,0);}
-    text("A OPEN    X NEW PLAYLIST    B BACK",360,665,10,muted,1);
+    int total=n+1;for(int i=0;i<10&&scroll_pos+i<total;i++){int at=scroll_pos+i,y=126+i*51;if(at==selected)round_panel(36,y,648,45,rgb(55,44,69));if(at==0){circle(63,y+22,17,rgb(242,112,174),1);line(63,y+14,63,y+30,white);line(55,y+22,71,y+22,white);text("CREATE PLAYLIST",96,y+15,14,white,0);text("Start a new collection",96,y+34,8,muted,0);}else{char title[MAX_PATH];snprintf(title,sizeof(title),"%s",names[at-1]);title[strlen(title)-4]=0;text(title,72,y+16,14,white,0);}}
+    text("A OPEN / CREATE   B BACK",360,672,9,muted,1);
+}
+static void change_volume(int delta) {
+    volume+=delta;if(volume<0)volume=0;if(volume>100)volume=100;mpv_set_volume(volume);volume_overlay_value=volume;volume_overlay_until=SDL_GetTicks()+1450;
+}
+static void toggle_shuffle(void) {shuffle_enabled=!shuffle_enabled;save_config();toast_msg(shuffle_enabled?"SHUFFLE ON":"SHUFFLE OFF");}
+static void cycle_repeat(void) {repeat_mode=(repeat_mode+1)%3;save_config();toast_msg(repeat_mode==0?"REPEAT OFF":repeat_mode==1?"REPEAT ALL":"REPEAT ONE");}
+static int write_led_value(int value) {
+    FILE *f=fopen("/sys/class/leds/joyled/brightness","w");
+    if(!f)return 0;
+    int ok=fprintf(f,"%d\n",value)>0;
+    if(fclose(f)!=0)ok=0;
+    return ok;
+}
+static int set_led_rgb(int r,int g,int b) {
+    if(led_driver==1){
+        /* ArkOS4Clone JoyLED v2 exposes named colour presets through brightness,
+           not arbitrary RGB channels. Pick the closest documented static colour. */
+        static const int palette[][4]={{255,0,0,20},{255,255,0,40},{0,255,0,60},{255,0,255,150},{0,255,255,170}};
+        if(r==0&&g==0&&b==0)return write_led_value(0);
+        double best=1.0e30;int value=20;
+        for(size_t i=0;i<sizeof(palette)/sizeof(palette[0]);i++){
+            double dr=(double)r-palette[i][0],dg=(double)g-palette[i][1],db=(double)b-palette[i][2];
+            double d=dr*dr+dg*dg+db*db;if(d<best){best=d;value=palette[i][3];}
+        }
+        return write_led_value(value);
+    }
+    if(led_driver==2){
+        char rgb_value[48];snprintf(rgb_value,sizeof(rgb_value),"%d %d %d",r,g,b);
+        pid_t pid=fork();if(pid<0)return 0;
+        if(pid==0){execlp("batocera-led-handheld","batocera-led-handheld","set_color_force_dec",rgb_value,(char*)NULL);_exit(127);}
+        int status=0;if(waitpid(pid,&status,0)<0)return 0;
+        return WIFEXITED(status)&&WEXITSTATUS(status)==0;
+    }
+    return 0;
+}
+static void detect_led_support(void) {
+    led_driver=0;
+    if(access("/sys/class/leds/joyled/brightness",W_OK)==0)led_driver=1;
+    else if(access("/usr/bin/batocera-led-handheld",X_OK)==0||access("/usr/local/bin/batocera-led-handheld",X_OK)==0)led_driver=2;
+    led_available=(led_driver!=0);
+}
+static void update_joystick_led(void) {
+    if(!led_available)return;
+    Uint32 now=SDL_GetTicks();if(now-last_led_poll<450)return;last_led_poll=now;
+    if(led_mode==2&&led_driver==1){
+        /* The supported JoyLED driver provides a built-in wave mode (brightness=200).
+           It is generated by the LED controller and is not a live audio spectrum. */
+        if(last_led_r!=-2){if(write_led_value(200)){last_led_r=-2;last_led_g=last_led_b=0;}}
+        return;
+    }
+    int r=0,g=0,b=0;
+    if(led_mode==0){r=g=b=0;}
+    else if(led_mode==1){r=accent.r;g=accent.g;b=accent.b;}
+    else {
+        /* Batocera fallback: a low-cost ambience pulse, not an audio analyser. */
+        double wave=(sin((double)now/260.0)+1.0)*0.5;double gain=0.28+0.72*wave;
+        if(current_track<0||paused)gain=0.18;
+        r=(int)(accent.r*gain);g=(int)(accent.g*gain);b=(int)(accent.b*gain);
+    }
+    if(r==last_led_r&&g==last_led_g&&b==last_led_b)return;
+    if(set_led_rgb(r,g,b)){last_led_r=r;last_led_g=g;last_led_b=b;}
 }
 static void handle_settings(int key) {
     if(key==SDLK_LEFT||key==SDLK_RIGHT||key==SDLK_RETURN||key==SDLK_z||key==SDLK_SPACE){int dir=(key==SDLK_LEFT)?-1:1;
@@ -684,68 +862,119 @@ static void handle_settings(int key) {
         case 3:crossfade_seconds+=dir;if(crossfade_seconds<1)crossfade_seconds=12;if(crossfade_seconds>12)crossfade_seconds=1;break;
         case 4:{const char *s[]={"Name","Genre","Album Artist","Artist","Album","Year","Duration"};int i=0;for(;i<7;i++)if(!strcasecmp(sort_order,s[i]))break;i=(i+7+dir)%7;snprintf(sort_order,sizeof(sort_order),"%s",s[i]);rebuild_view();break;}
         case 5:reload_library();break;
-        case 6:volume+=dir*5;if(volume<0)volume=0;if(volume>100)volume=100;mpv_set_volume(volume);break;
-        case 7:page=PAGE_BUTTON_SETUP;setup_step=0;setup_active=1;button_setup_done=0;toast_msg("MAP CONTROLS");break;
+        case 6:change_volume(dir*5);break;
+        case 7:led_mode=(led_mode+3+dir)%3;if(!led_available)toast_msg("JOYSTICK LED NOT AVAILABLE ON THIS FIRMWARE");else{last_led_r=last_led_g=last_led_b=-1;update_joystick_led();}break;
         case 8:{const char *home="/roms/ports/Aurora-R36";char cmd[256];snprintf(cmd,sizeof(cmd),"AURORA_HOME='%s' sh '%s/update.sh' >/tmp/aurora-update.log 2>&1 &",home,home);int rc=system(cmd);toast_msg(rc==0?"OPENING UPDATE CHECK":"UPDATE LAUNCH FAILED");break;}}
         save_config();
     } else if(key==SDLK_UP){selected=(selected+8)%9;}else if(key==SDLK_DOWN){selected=(selected+1)%9;}
 }
 static void activate_selected(void) {
-    if(page==PAGE_HOME){switch(selected){case 0:set_page_list(LIST_ALL,"ALL SONGS");break;case 1:set_page_list(LIST_ARTISTS,"ARTISTS");break;case 2:set_page_list(LIST_ALBUMS,"ALBUMS");break;case 3:open_playlists();break;case 4:page=PAGE_SETTINGS;selected=0;break;}return;}
+    if(page==PAGE_HOME){switch(selected){case 0:set_page_list(LIST_RECENT,"RECENTLY ADDED");break;case 1:set_page_list(LIST_ALL,"SONGS");break;case 2:set_page_list(LIST_ARTISTS,"ARTISTS");break;case 3:set_page_list(LIST_ALBUMS,"ALBUMS");break;case 4:open_playlists();break;case 5:page=PAGE_FOLDERS;snprintf(folder_current,sizeof(folder_current),"%s",music_folder);load_folder_entries();scroll_pos=0;break;case 6:page=PAGE_SETTINGS;selected=0;break;case 7:if(current_track>=0)page=PAGE_NOW;break;}return;}
     if(page==PAGE_LIST){if(selected<0||selected>=view_count)return;int idx=view_indices[selected];if(list_kind==LIST_ARTISTS||list_kind==LIST_ALBUMS){/* Filter list to selected group. */char key[256];snprintf(key,sizeof(key),"%s",list_kind==LIST_ARTISTS?tracks[idx].album_artist:tracks[idx].album);int n=0;for(int i=0;i<track_count;i++)if(!strcasecmp(list_kind==LIST_ARTISTS?tracks[i].album_artist:tracks[i].album,key))view_indices[n++]=i;view_count=n;list_kind=LIST_ALL;snprintf(page_title,sizeof(page_title),"%s",key);selected=0;scroll_pos=0;return;}queue_count=view_count;for(int i=0;i<view_count;i++)queue_indices[i]=view_indices[i];queue_pos=selected;play_index(idx);return;}
-    if(page==PAGE_PLAYLISTS){DIR *d=opendir(playlist_dir);char names[512][MAX_PATH];int n=0;struct dirent *e;if(d){while((e=readdir(d))&&n<512){size_t z=strlen(e->d_name);if(z>4&&!strcasecmp(e->d_name+z-4,".m3u"))snprintf(names[n++],MAX_PATH,"%s",e->d_name);}closedir(d);}if(selected<n){char p[MAX_PATH];snprintf(p,sizeof(p),"%s/%s",playlist_dir,names[selected]);build_playlist_view(p);}return;}
+    if(page==PAGE_PLAYLISTS){if(selected==0){start_new_playlist();return;}DIR *d=opendir(playlist_dir);char names[512][MAX_PATH];int n=0;struct dirent *e;if(d){while((e=readdir(d))&&n<512){size_t z=strlen(e->d_name);if(z>4&&!strcasecmp(e->d_name+z-4,".m3u"))snprintf(names[n++],MAX_PATH,"%s",e->d_name);}closedir(d);}if(selected-1<n){char p[MAX_PATH];snprintf(p,sizeof(p),"%s/%s",playlist_dir,names[selected-1]);build_playlist_view(p);}return;}
 }
 static void start_new_playlist(void) {
     int n=1;char p[MAX_PATH];do{snprintf(playlist_name,sizeof(playlist_name),"PLAYLIST %02d",n++);snprintf(p,sizeof(p),"%s/%s.m3u",playlist_dir,playlist_name);}while(access(p,F_OK)==0&&n<1000);
     if(create_playlist_file(playlist_name))toast_msg("PLAYLIST CREATED");else toast_msg("PLAYLIST FAILED");
 }
 static int playlist_file_count(void) {int n=0;DIR *d=opendir(playlist_dir);if(!d)return 0;struct dirent *e;while((e=readdir(d))){size_t z=strlen(e->d_name);if(z>4&&!strcasecmp(e->d_name+z-4,".m3u"))n++;}closedir(d);return n;}
-static void handle_key(SDL_Keycode key) {
-    if(text_entry){if(key==SDLK_ESCAPE){text_entry=0;return;}if(key==SDLK_RETURN){text_entry=0;if(create_playlist_file(playlist_name))toast_msg("PLAYLIST CREATED");return;}if(key==SDLK_BACKSPACE){size_t n=strlen(playlist_name);if(n)playlist_name[n-1]=0;}return;}
-    if(page==PAGE_BUTTON_SETUP){if(key==SDLK_ESCAPE||key==SDLK_BACKSPACE){page=PAGE_SETTINGS;setup_active=0;return;}return;}
-    if(page==PAGE_NOW){if(key==SDLK_ESCAPE||key==SDLK_BACKSPACE){page=PAGE_HOME;return;}if(key==SDLK_LEFT){play_next(-1);return;}if(key==SDLK_RIGHT){play_next(1);return;}if(key==SDLK_SPACE||key==SDLK_RETURN){mpv_cmd("{\"command\":[\"cycle\",\"pause\"]}");paused=!paused;return;}if(key==SDLK_UP){char c[128];position_sec-=10;if(position_sec<0)position_sec=0;snprintf(c,sizeof(c),"{\"command\":[\"seek\",%.1f,\"absolute\"]}",position_sec);mpv_cmd(c);return;}if(key==SDLK_DOWN){char c[128];position_sec+=10;snprintf(c,sizeof(c),"{\"command\":[\"seek\",%.1f,\"absolute\"]}",position_sec);mpv_cmd(c);return;}return;}
-    if(key==SDLK_ESCAPE||key==SDLK_BACKSPACE){if(page==PAGE_FOLDERS)page=PAGE_SETTINGS;else page=PAGE_HOME;selected=0;return;}
-    if(key==SDLK_F1){page=PAGE_SETTINGS;selected=0;return;}
-    if(key==SDLK_v){page=PAGE_NOW;return;}
-    if(key==SDLK_UP){if(page==PAGE_SETTINGS){selected=(selected+8)%9;}else if(page==PAGE_FOLDERS){folder_selected=(folder_selected+folder_count-1)%folder_count;if(folder_selected<scroll_pos)scroll_pos=folder_selected;}else{int max=page==PAGE_HOME?5:page==PAGE_PLAYLISTS?playlist_file_count():view_count;if(max>0)selected=(selected+max-1)%max;if(selected<scroll_pos)scroll_pos=selected;}return;}
-    if(key==SDLK_DOWN){if(page==PAGE_SETTINGS){selected=(selected+1)%9;}else if(page==PAGE_FOLDERS){folder_selected=(folder_selected+1)%folder_count;if(folder_selected>=scroll_pos+10)scroll_pos=folder_selected-9;}else{int max=page==PAGE_HOME?5:page==PAGE_PLAYLISTS?playlist_file_count():view_count;if(max>0)selected=(selected+1)%max;if(selected>=scroll_pos+10)scroll_pos=selected-9;}return;}
-    if(page==PAGE_SETTINGS){if(key==SDLK_LEFT||key==SDLK_RIGHT||key==SDLK_RETURN||key==SDLK_z||key==SDLK_SPACE)handle_settings(key);return;}
-    if(page==PAGE_FOLDERS){if(key==SDLK_RETURN||key==SDLK_z)folder_activate();return;}
-    if(key==SDLK_TAB){const char *s[]={"Name","Genre","Album Artist","Artist","Album","Year","Duration"};int i=0;for(;i<7;i++)if(!strcasecmp(sort_order,s[i]))break;snprintf(sort_order,sizeof(sort_order),"%s",s[(i+1)%7]);rebuild_view();return;}
-    if(key==SDLK_x||key==SDLK_c){if(page==PAGE_LIST&&view_count){add_to_playlist(view_indices[selected]);return;}if(page==PAGE_PLAYLISTS){start_new_playlist();return;}}
-    if(key==SDLK_RETURN||key==SDLK_z||key==SDLK_SPACE){if(page==PAGE_HOME)activate_selected();else if(page==PAGE_LIST)activate_selected();else if(page==PAGE_PLAYLISTS)activate_selected();return;}
+enum { DIR_UP=0, DIR_DOWN=1, DIR_LEFT=2, DIR_RIGHT=3 };
+static void seek_by_seconds(int delta) {
+    position_sec+=delta;if(position_sec<0)position_sec=0;if(duration_sec>0&&position_sec>duration_sec)position_sec=duration_sec;
+    char c[128];snprintf(c,sizeof(c),"{\"command\":[\"seek\",%.1f,\"absolute\"]}",position_sec);mpv_cmd(c);seek_overlay_direction=delta>=0?1:-1;seek_overlay_until=SDL_GetTicks()+900;
 }
-static void capture_binding(int kind,int code) {
-    if(page!=PAGE_BUTTON_SETUP||!setup_active||setup_step>=8)return;
-    button_map[setup_step].kind=kind;button_map[setup_step].code=code;
-    setup_step++;
-    if(setup_step>=8){setup_active=0;button_setup_done=1;save_config();page=PAGE_HOME;selected=0;toast_msg("BUTTON MAPPING SAVED");}
+static void direction_press(int dir) {
+    if(dir<0||dir>3||held_dirs[dir])return;
+    held_dirs[dir]=1;held_since[dir]=SDL_GetTicks();held_repeat[dir]=held_since[dir]+420;held_long[dir]=0;
+    if(page==PAGE_NOW){if(dir==DIR_UP)change_volume(5);else if(dir==DIR_DOWN)change_volume(-5);return;}
+    if(dir==DIR_UP||dir==DIR_DOWN)handle_key(dir==DIR_UP?SDLK_UP:SDLK_DOWN);
+    else if(page==PAGE_SETTINGS)handle_settings(dir==DIR_LEFT?SDLK_LEFT:SDLK_RIGHT);
 }
-static int binding_matches(int index,int kind,int code) {
-    return index>=0&&index<8&&button_map[index].kind==kind&&button_map[index].code==code;
+static void direction_release(int dir) {
+    if(dir<0||dir>3||!held_dirs[dir])return;
+    Uint32 elapsed=SDL_GetTicks()-held_since[dir];held_dirs[dir]=0;
+    if(page==PAGE_NOW&&(dir==DIR_LEFT||dir==DIR_RIGHT)&&elapsed<420){play_next(dir==DIR_RIGHT?1:-1);return;}
 }
-static void dispatch_mapped(int index) {
-    switch(index){
-        case 0:handle_key(SDLK_UP);break;case 1:handle_key(SDLK_DOWN);break;
-        case 2:handle_key(SDLK_LEFT);break;case 3:handle_key(SDLK_RIGHT);break;
-        case 4:handle_key(SDLK_RETURN);break;case 5:handle_key(SDLK_ESCAPE);break;
-        case 6:if(page==PAGE_NOW)play_next(1);else handle_key(SDLK_TAB);break;
-        case 7:if(page==PAGE_NOW)play_next(-1);else handle_key(SDLK_TAB);break;
+static void process_held_directions(void) {
+    Uint32 now=SDL_GetTicks();for(int d=0;d<4;d++)if(held_dirs[d]){
+        if(page==PAGE_NOW){
+            if(d==DIR_LEFT||d==DIR_RIGHT){if(now-held_since[d]>=420){if(!held_long[d]){held_long[d]=1;seek_by_seconds(d==DIR_RIGHT?5:-5);held_repeat[d]=now+170;}else if(now>=held_repeat[d]){seek_by_seconds(d==DIR_RIGHT?5:-5);held_repeat[d]=now+170;}}}
+            else if(now>=held_repeat[d]){change_volume(d==DIR_UP?5:-5);held_repeat[d]=now+150;}
+        } else if((d==DIR_UP||d==DIR_DOWN)&&now>=held_repeat[d]){handle_key(d==DIR_UP?SDLK_UP:SDLK_DOWN);held_repeat[d]=now+145;}
     }
+}
+static void quit_app(void){running=0;}
+static void controller_button(int button,int down) {
+    if(button==SDL_CONTROLLER_BUTTON_BACK){select_pressed=down;}
+    if(button==SDL_CONTROLLER_BUTTON_START){start_pressed=down;}
+    if(select_pressed&&start_pressed){quit_app();return;}
+    if(button==SDL_CONTROLLER_BUTTON_DPAD_UP){if(down)direction_press(DIR_UP);else direction_release(DIR_UP);return;}
+    if(button==SDL_CONTROLLER_BUTTON_DPAD_DOWN){if(down)direction_press(DIR_DOWN);else direction_release(DIR_DOWN);return;}
+    if(button==SDL_CONTROLLER_BUTTON_DPAD_LEFT){if(down)direction_press(DIR_LEFT);else direction_release(DIR_LEFT);return;}
+    if(button==SDL_CONTROLLER_BUTTON_DPAD_RIGHT){if(down)direction_press(DIR_RIGHT);else direction_release(DIR_RIGHT);return;}
+    if(!down)return;
+    if(button==SDL_CONTROLLER_BUTTON_A){if(page==PAGE_NOW){mpv_cmd("{\"command\":[\"cycle\",\"pause\"]}");paused=!paused;}else if(page==PAGE_HOME||page==PAGE_LIST||page==PAGE_PLAYLISTS)activate_selected();else if(page==PAGE_FOLDERS)folder_activate();else if(page==PAGE_SETTINGS)handle_settings(SDLK_RETURN);}
+    else if(button==SDL_CONTROLLER_BUTTON_B){if(page==PAGE_NOW){page=page_before_now;}else if(page==PAGE_FOLDERS||page==PAGE_SETTINGS||page==PAGE_LIST||page==PAGE_PLAYLISTS){page=PAGE_HOME;selected=0;} }
+    else if(button==SDL_CONTROLLER_BUTTON_X)toggle_shuffle();
+    else if(button==SDL_CONTROLLER_BUTTON_Y)cycle_repeat();
+}
+static void raw_button(int button,int down) {
+    /* Common R36-family raw SDL joystick layout (used only when SDL has no
+       GameController mapping): 0=B, 1=A, 2=X, 3=Y, 8..11=D-pad,
+       12=Select, 13=Start. Shoulder buttons intentionally do nothing. */
+    if(button>=8 && button<=11) {
+        int dir=button-8;
+        if(down) direction_press(dir); else direction_release(dir);
+        return;
+    }
+    if(button==12){select_pressed=down;if(select_pressed&&start_pressed)quit_app();return;}
+    if(button==13){start_pressed=down;if(select_pressed&&start_pressed)quit_app();return;}
+    if(!down)return;
+    if(button==0)controller_button(SDL_CONTROLLER_BUTTON_B,1);
+    else if(button==1)controller_button(SDL_CONTROLLER_BUTTON_A,1);
+    else if(button==2)controller_button(SDL_CONTROLLER_BUTTON_X,1);
+    else if(button==3)controller_button(SDL_CONTROLLER_BUTTON_Y,1);
+    /* L1/R1/L2/R2, stick-click and FN buttons intentionally have no action. */
+}
+static void axis_direction(int axis,int value) {
+    if(page==PAGE_NOW || axis<0 || axis>=4)return;
+    int dir=0;const int deadzone=10500;
+    if(axis==SDL_CONTROLLER_AXIS_LEFTX||axis==SDL_CONTROLLER_AXIS_RIGHTX)dir=value<-deadzone?DIR_LEFT:value>deadzone?DIR_RIGHT:-1;
+    else dir=value<-deadzone?DIR_UP:value>deadzone?DIR_DOWN:-1;
+    int slot=axis;int old=stick_dirs[slot];if(dir<0){if(old){direction_release(old);stick_dirs[slot]=0;}return;}
+    if(old!=dir){if(old)direction_release(old);stick_dirs[slot]=dir;direction_press(dir);stick_repeat[slot]=SDL_GetTicks()+260;}
+    else if(SDL_GetTicks()>=stick_repeat[slot]){direction_release(dir);direction_press(dir);stick_repeat[slot]=SDL_GetTicks()+145;}
+}
+static void handle_hat(int value) {
+    const int mask[4]={SDL_HAT_UP,SDL_HAT_DOWN,SDL_HAT_LEFT,SDL_HAT_RIGHT};
+    for(int i=0;i<4;i++){int was=(hat_dirs&mask[i])!=0,now=(value&mask[i])!=0;if(now&&!was)direction_press(i);else if(was&&!now)direction_release(i);}
+    hat_dirs=value;
 }
 static void handle_controller(const SDL_Event *e) {
-    if(e->type==SDL_JOYBUTTONDOWN){
-        int b=e->jbutton.button;
-        if(page==PAGE_BUTTON_SETUP){capture_binding(1,b);return;}
-        for(int i=0;i<8;i++)if(binding_matches(i,1,b)){dispatch_mapped(i);return;}
-    } else if(e->type==SDL_JOYHATMOTION){
-        int v=e->jhat.value;
-        if(page==PAGE_BUTTON_SETUP){if(v==SDL_HAT_UP||v==SDL_HAT_DOWN||v==SDL_HAT_LEFT||v==SDL_HAT_RIGHT)capture_binding(2,v);return;}
-        if(v==SDL_HAT_UP||v==SDL_HAT_DOWN||v==SDL_HAT_LEFT||v==SDL_HAT_RIGHT)
-            for(int i=0;i<4;i++)if(binding_matches(i,2,v)){dispatch_mapped(i);return;}
-    }
+    if(e->type==SDL_CONTROLLERBUTTONDOWN)controller_button(e->cbutton.button,1);
+    else if(e->type==SDL_CONTROLLERBUTTONUP)controller_button(e->cbutton.button,0);
+    else if(e->type==SDL_CONTROLLERAXISMOTION)axis_direction(e->caxis.axis,e->caxis.value);
+    else if(e->type==SDL_JOYBUTTONDOWN&&!game_controller)raw_button(e->jbutton.button,1);
+    else if(e->type==SDL_JOYBUTTONUP&&!game_controller)raw_button(e->jbutton.button,0);
+    else if(e->type==SDL_JOYHATMOTION&&!game_controller)handle_hat(e->jhat.value);
+    else if(e->type==SDL_JOYAXISMOTION&&!game_controller)axis_direction(e->jaxis.axis,e->jaxis.value);
+}
+static void handle_key(SDL_Keycode key) {
+    if(text_entry){if(key==SDLK_ESCAPE){text_entry=0;return;}if(key==SDLK_RETURN){text_entry=0;if(create_playlist_file(playlist_name))toast_msg("PLAYLIST CREATED");return;}if(key==SDLK_BACKSPACE){size_t n=strlen(playlist_name);if(n)playlist_name[n-1]=0;}return;}
+    if(page==PAGE_NOW){if(key==SDLK_ESCAPE||key==SDLK_BACKSPACE){page=page_before_now;return;}if(key==SDLK_SPACE||key==SDLK_RETURN){mpv_cmd("{\"command\":[\"cycle\",\"pause\"]}");paused=!paused;return;}if(key==SDLK_x)toggle_shuffle();if(key==SDLK_y)cycle_repeat();return;}
+    if(key==SDLK_ESCAPE||key==SDLK_BACKSPACE){if(page==PAGE_HOME)quit_app();else{page=PAGE_HOME;selected=0;}return;}
+    if(key==SDLK_F1){page=PAGE_SETTINGS;selected=0;return;}
+    if(key==SDLK_v){if(current_track>=0)page=PAGE_NOW;return;}
+    if(key==SDLK_UP){if(page==PAGE_SETTINGS)selected=(selected+8)%9;else if(page==PAGE_FOLDERS){if(folder_count>0)folder_selected=(folder_selected+folder_count-1)%folder_count;if(folder_selected<scroll_pos)scroll_pos=folder_selected;}else{int max=page==PAGE_HOME?(current_track>=0?8:7):page==PAGE_PLAYLISTS?playlist_file_count()+1:view_count;if(max>0)selected=(selected+max-1)%max;if(selected<scroll_pos)scroll_pos=selected;}return;}
+    if(key==SDLK_DOWN){if(page==PAGE_SETTINGS)selected=(selected+1)%9;else if(page==PAGE_FOLDERS){if(folder_count>0)folder_selected=(folder_selected+1)%folder_count;if(folder_selected>=scroll_pos+10)scroll_pos=folder_selected-9;}else{int max=page==PAGE_HOME?(current_track>=0?8:7):page==PAGE_PLAYLISTS?playlist_file_count()+1:view_count;if(max>0)selected=(selected+1)%max;if(selected>=scroll_pos+10)scroll_pos=selected-9;}return;}
+    if(page==PAGE_SETTINGS){if(key==SDLK_LEFT||key==SDLK_RIGHT||key==SDLK_RETURN||key==SDLK_z||key==SDLK_SPACE)handle_settings(key);return;}
+    if(page==PAGE_FOLDERS){if(key==SDLK_RETURN||key==SDLK_z)folder_activate();return;}
+    if(key==SDLK_TAB){const char *sorts[]={"Name","Genre","Album Artist","Artist","Album","Year","Duration"};int i=0;for(;i<7;i++)if(!strcasecmp(sort_order,sorts[i]))break;snprintf(sort_order,sizeof(sort_order),"%s",sorts[(i+1)%7]);rebuild_view();return;}
+    if(key==SDLK_x)toggle_shuffle();else if(key==SDLK_y)cycle_repeat();
+    else if(key==SDLK_RETURN||key==SDLK_z||key==SDLK_SPACE){if(page==PAGE_HOME||page==PAGE_LIST||page==PAGE_PLAYLISTS)activate_selected();}
 }
 static void poll_player(void) {
+    update_joystick_led();process_held_directions();
     static Uint32 last=0;Uint32 now=SDL_GetTicks();
     if(fade_stage){if(now-last>=45){last=now;update_fade();}return;}
     if(now-last<300)return;
@@ -760,13 +989,13 @@ static void cleanup(void) {
     if(cover_texture)SDL_DestroyTexture(cover_texture);
     if(cover_surface)SDL_FreeSurface(cover_surface);
     for(int i=0;i<12;i++)if(thumbs[i].texture)SDL_DestroyTexture(thumbs[i].texture);
-    if(joystick)SDL_JoystickClose(joystick);
+    if(game_controller)SDL_GameControllerClose(game_controller);else if(joystick)SDL_JoystickClose(joystick);
     if(renderer)SDL_DestroyRenderer(renderer);
     if(window)SDL_DestroyWindow(window);
     SDL_Quit();
 }
 int main(int argc,char **argv) {
-    if(argc>1&&!strcmp(argv[1],"--version")){puts("Aurora R36 Native C 0.3.0");return 0;}
+    if(argc>1&&!strcmp(argv[1],"--version")){printf("Aurora R36 Native C %s\n", APP_VERSION);return 0;}
     load_config();
     if(SDL_Init(SDL_INIT_VIDEO|SDL_INIT_AUDIO|SDL_INIT_JOYSTICK|SDL_INIT_GAMECONTROLLER)<0){fprintf(stderr,"SDL init failed: %s\n",SDL_GetError());return 1;}
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY,"1");SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS,"0");
@@ -774,10 +1003,18 @@ int main(int argc,char **argv) {
     window=SDL_CreateWindow(APP_NAME,SDL_WINDOWPOS_CENTERED,SDL_WINDOWPOS_CENTERED,W,H,flags);if(!window){fprintf(stderr,"SDL window failed: %s\n",SDL_GetError());SDL_Quit();return 1;}
     renderer=SDL_CreateRenderer(window,-1,SDL_RENDERER_ACCELERATED|SDL_RENDERER_PRESENTVSYNC);if(!renderer)renderer=SDL_CreateRenderer(window,-1,SDL_RENDERER_SOFTWARE);if(!renderer){fprintf(stderr,"SDL renderer failed: %s\n",SDL_GetError());SDL_DestroyWindow(window);SDL_Quit();return 1;}
     if(pthread_create(&thumb_worker,NULL,thumb_worker_main,NULL)==0)thumb_worker_running=1;
-    SDL_RenderSetLogicalSize(renderer,W,H);if(SDL_NumJoysticks()>0){joystick=SDL_JoystickOpen(0);}
+    SDL_RenderSetLogicalSize(renderer,W,H);
+    if(SDL_NumJoysticks()>0){if(SDL_IsGameController(0)){game_controller=SDL_GameControllerOpen(0);if(game_controller)joystick=SDL_GameControllerGetJoystick(game_controller);}if(!game_controller)joystick=SDL_JoystickOpen(0);}
+    detect_led_support();
     if(!mpv_start())toast_msg("MPV NOT FOUND - INSTALL MPV");else mpv_set_volume(volume);
-    reload_library();selected=0;page=button_setup_done?PAGE_HOME:PAGE_BUTTON_SETUP;setup_step=0;setup_active=!button_setup_done;Uint32 last_tick=SDL_GetTicks();
-    while(running){SDL_Event e;while(SDL_PollEvent(&e)){if(e.type==SDL_QUIT)running=0;else if(e.type==SDL_KEYDOWN)handle_key(e.key.keysym.sym);else if(e.type==SDL_TEXTINPUT&&text_entry){size_t n=strlen(playlist_name);if(n+strlen(e.text.text)<sizeof(playlist_name)-1)strcat(playlist_name,e.text.text);}else if(e.type==SDL_JOYBUTTONDOWN||e.type==SDL_JOYHATMOTION)handle_controller(&e);}
+    reload_library();selected=0;page=PAGE_HOME;volume_overlay_value=volume;last_status_poll=0;update_joystick_led();Uint32 last_tick=SDL_GetTicks();
+    while(running){SDL_Event e;while(SDL_PollEvent(&e)){
+        if(e.type==SDL_QUIT)running=0;
+        else if(e.type==SDL_KEYDOWN&&!e.key.repeat){SDL_Keycode k=e.key.keysym.sym;if(k==SDLK_UP)direction_press(DIR_UP);else if(k==SDLK_DOWN)direction_press(DIR_DOWN);else if(k==SDLK_LEFT)direction_press(DIR_LEFT);else if(k==SDLK_RIGHT)direction_press(DIR_RIGHT);else handle_key(k);}
+        else if(e.type==SDL_KEYUP){SDL_Keycode k=e.key.keysym.sym;if(k==SDLK_UP)direction_release(DIR_UP);else if(k==SDLK_DOWN)direction_release(DIR_DOWN);else if(k==SDLK_LEFT)direction_release(DIR_LEFT);else if(k==SDLK_RIGHT)direction_release(DIR_RIGHT);}
+        else if(e.type==SDL_TEXTINPUT&&text_entry){size_t n=strlen(playlist_name);if(n+strlen(e.text.text)<sizeof(playlist_name)-1)strcat(playlist_name,e.text.text);}
+        else if(e.type==SDL_CONTROLLERBUTTONDOWN||e.type==SDL_CONTROLLERBUTTONUP||e.type==SDL_CONTROLLERAXISMOTION||e.type==SDL_JOYBUTTONDOWN||e.type==SDL_JOYBUTTONUP||e.type==SDL_JOYHATMOTION||e.type==SDL_JOYAXISMOTION)handle_controller(&e);
+    }
         if(page==PAGE_PLAYLISTS){/* list view is refreshed in renderer */}
         poll_player();if(SDL_GetTicks()-last_tick>16){render();last_tick=SDL_GetTicks();}SDL_Delay(2);
     }
